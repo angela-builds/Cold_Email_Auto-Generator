@@ -1,0 +1,193 @@
+// ============================================================
+// 🔧 設定區 — 只需修改這裡
+// ============================================================
+const PAIN_POINT_DB_ID = ''; // ⚠️ 填入你的 Pain_Point_DB 試算表 ID
+const GEMINI_API_KEY   = ''; // ⚠️ 填入你的 Gemini API Key
+const GEMINI_MODEL     = 'gemini-2.5-flash'; // 🌟 確保使用能成功執行的模型版本
+
+// ============================================================
+// 🚀 主程式：狙擊手模式自動發信系統
+// ============================================================
+function generateEmails() {
+  const ss            = SpreadsheetApp.getActiveSpreadsheet();
+  const customerSheet = ss.getSheetByName('Customer_List');
+  const productSheet  = ss.getSheetByName('Product_Master');
+  const companySheet  = ss.getSheetByName('Company_Profile');
+
+  const painSS    = SpreadsheetApp.openById(PAIN_POINT_DB_ID);
+  const painSheet = painSS.getSheetByName('Pain_Point_DB');
+
+  const customers = sheetToObjects(customerSheet);
+  const pains     = sheetToObjects(painSheet);
+  const products  = sheetToObjects(productSheet);
+  const company   = sheetToObjects(companySheet)[0];
+
+  // 公司背景（只給 AI 參考，不輸出進信件）
+  const companyContext = [
+    `Brand: ${company['Brand_Name']}`,
+    `Core Business: ${company['Core_Business']}`,
+    `Manufacturing: ${company['Manufacturing_Value']}`,
+    `ODM/OEM: ${company['ODM_OEM_Strength']}`
+  ].join('\n');
+
+  // 取得欄位位置
+  const headers        = customerSheet.getRange(1, 1, 1, customerSheet.getLastColumn()).getValues()[0];
+  const statusCol      = headers.indexOf('Status') + 1;
+  const emailOutputCol = headers.indexOf('Email_Output') + 1;
+
+  customers.forEach((customer, index) => {
+    if (customer['Status'] !== 'Waiting') return; // 🌟 只處理狀態為 Waiting 的客戶
+
+    const rowNum           = index + 2;
+    const clientURL        = customer['Client_URL'];
+    const industry         = customer['Industry'];
+    const recommendedModel = customer['Recommended_Model'];
+    const category         = customer['Category'] || '';
+    const companyName      = customer['Company_Name'] || 'your company';
+
+    Logger.log(`🔎 正在處理：${companyName} (${clientURL})`);
+
+    // ── 第一層過濾：用 Client_URL 精準比對 ──────────────────
+    let relevantPains = pains.filter(r => r['Client URL'] === clientURL);
+
+    // ── 第二層過濾：沒有資料就用 Industry 撈同產業 ──────────
+    if (relevantPains.length === 0) {
+      relevantPains = pains.filter(r => r['Industry'] === industry);
+      Logger.log(`無精準資料，改用 Industry="${industry}" 過濾，共 ${relevantPains.length} 筆`);
+    }
+
+    // ── 第三層過濾：若 Category 有填，再縮小範圍 ─────────────
+    if (category && relevantPains.length > 0) {
+      const cats     = category.split(',').map(c => c.trim());
+      const filtered = relevantPains.filter(r => cats.some(c => r['Category'].includes(c)));
+      if (filtered.length > 0) relevantPains = filtered;
+    }
+
+    if (relevantPains.length === 0) {
+      Logger.log(`❌ 找不到任何痛點資料，跳過`);
+      customerSheet.getRange(rowNum, statusCol).setValue('No Data');
+      return;
+    }
+
+    // 🌟🌟🌟 狙擊手模式：只取「第一筆」最精準的痛點 🌟🌟🌟
+    const targetPain = relevantPains[0];
+    Logger.log(`🎯 鎖定單一痛點: ${targetPain['Pain'].substring(0, 30)}...`);
+
+    // 組裝單一痛點文字
+    const painContext = `[Target Pain Point]: ${targetPain['Pain']}\n[Our Solution]: ${targetPain['Solution']}`;
+
+    // 產品資料
+    const product = products.find(p => p['Model'] === recommendedModel);
+    const productContext = product
+      ? `Product Model: ${product['product_name']}\nUSP: ${product['Unique Selling Point']}\nBenefits: ${product['Benefits']}\nSpecs: ${product['Specs']}`
+      : '';
+
+    // 🌟🌟🌟 究極 Prompt：明確指示 AI 只針對一個痛點攻擊 🌟🌟🌟
+    const prompt = `
+You are an elite B2B cold email writer for Kupo Mounting Solution.
+
+## Kupo background (for reference only — do NOT copy into the email):
+${companyContext}
+
+## Target customer industry: ${industry}
+
+## The SINGLE Pain Point to focus on:
+${painContext}
+
+${productContext ? `## Recommended product:\n${productContext}` : ''}
+
+## Instructions:
+Write a highly targeted cold outreach email under 120 words.
+- Focus ONLY on the [Target Pain Point] provided above. Do not invent other issues.
+- Present [Our Solution] naturally as the direct answer to this exact pain.
+- End with one clear CTA (Call to Action).
+- Tone: professional, direct, human.
+- Do NOT start with compliments or "I hope this email finds you well".
+- Do NOT mention Kupo's company history.
+- Output the email body only (no subject line, no explanation).
+`.trim();
+
+    // 呼叫 API
+    const emailContent = callGemini(prompt);
+
+    if (emailContent) {
+      // 1. 寫回試算表
+      customerSheet.getRange(rowNum, emailOutputCol).setValue(emailContent);
+      customerSheet.getRange(rowNum, statusCol).setValue('Done');
+      
+      // 2. 自動產生 Gmail 草稿 
+      const subject = `Kupo Mounting Solutions for ${companyName}`; 
+      GmailApp.createDraft("", subject, emailContent);
+      
+      Logger.log(`✅ [${companyName}] 完成，並已產生 Gmail 草稿！`);
+    } else {
+      customerSheet.getRange(rowNum, statusCol).setValue('Error');
+    }
+
+    Utilities.sleep(2000); // 避免 API 頻率限制
+  });
+
+  Logger.log('🎉 全部處理完成！請至 Gmail 草稿匣查看。');
+  SpreadsheetApp.getUi().alert("✅ 發信任務完成！請到 Gmail 草稿匣檢查信件。");
+}
+
+// ============================================================
+// 🤖 Gemini API 呼叫 (防截斷強化版)
+// ============================================================
+function callGemini(prompt) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+  const payload = {
+    contents: [{ parts: [{ text: prompt }] }],
+    generationConfig: { 
+      temperature: 0.7, 
+      maxOutputTokens: 8192 // 🌟 徹底解放輸出字數上限
+    },
+    safetySettings: [ // 🌟 關閉安全審查，避免硬體術語 (Mount, shoot, tight) 被誤擋截斷
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+    ]
+  };
+
+  try {
+    const res = UrlFetchApp.fetch(url, {
+      method: 'POST',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true // 🌟 避免 404 或伺服器報錯時直接當機
+    });
+    
+    const data = JSON.parse(res.getContentText());
+    
+    if (data.error) {
+       Logger.log(`❌ API 拒絕請求: ${data.error.message}`);
+       return null;
+    }
+
+    const candidate = data.candidates[0];
+    
+    if (candidate.finishReason !== 'STOP') {
+       Logger.log(`⚠️ 警告：生成被強制中斷，原因：${candidate.finishReason}`);
+    }
+    
+    return candidate.content.parts[0].text.trim();
+  } catch (e) {
+    Logger.log(`❌ 執行錯誤: ${e}`);
+    return null;
+  }
+}
+
+// ============================================================
+// 🛠️ 工具：試算表轉 object array
+// ============================================================
+function sheetToObjects(sheet) {
+  const values  = sheet.getDataRange().getValues();
+  const headers = values[0];
+  return values.slice(1).map(row => {
+    const obj = {};
+    headers.forEach((h, i) => obj[h] = row[i]);
+    return obj;
+  });
+}
